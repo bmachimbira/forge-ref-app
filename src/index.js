@@ -7,6 +7,16 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// --- Config from env vars ---
+
+const APP_NAME = process.env.APP_NAME || "Snip";
+const SHORT_ID_LENGTH = parseInt(process.env.SHORT_ID_LENGTH || "8", 10);
+const CACHE_TTL = parseInt(process.env.CACHE_TTL_SECONDS || "3600", 10);
+const MAX_LINKS_PER_PAGE = parseInt(process.env.MAX_LINKS_PER_PAGE || "20", 10);
+const ENABLE_API = process.env.ENABLE_API !== "false";
+
+console.log("config:", { APP_NAME, SHORT_ID_LENGTH, CACHE_TTL, MAX_LINKS_PER_PAGE, ENABLE_API });
+
 // --- Clients ---
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
@@ -29,8 +39,6 @@ async function migrate() {
 
 // --- Helpers ---
 
-const CACHE_TTL = 3600; // 1 hour
-
 async function resolveLink(id) {
   // try redis first
   const cached = await redis.get(`link:${id}`);
@@ -51,7 +59,7 @@ function page(body) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Snip — URL Shortener</title>
+  <title>${APP_NAME} — URL Shortener</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:2rem 1rem}
@@ -75,7 +83,7 @@ function page(body) {
   </style>
 </head>
 <body>
-  <h1>Snip</h1>
+  <h1>${APP_NAME}</h1>
   <p class="sub">URL Shortener — Forge Reference App</p>
   ${body}
 </body>
@@ -83,6 +91,16 @@ function page(body) {
 }
 
 // --- Routes ---
+
+// Debug: show which env vars the app received (safe — only shows names + custom values)
+app.get("/debug/env", (_req, res) => {
+  const safeKeys = ["APP_NAME", "SHORT_ID_LENGTH", "CACHE_TTL_SECONDS", "MAX_LINKS_PER_PAGE", "ENABLE_API"];
+  const present = Object.keys(process.env)
+    .filter((k) => ["DATABASE_URL", "REDIS_URL", "S3_ENDPOINT", "S3_ACCESS_KEY", "S3_BUCKET", "PORT"].includes(k))
+    .map((k) => ({ key: k, value: "(set)" }));
+  const custom = safeKeys.map((k) => ({ key: k, value: process.env[k] || "(not set)" }));
+  res.json({ injected: present, custom });
+});
 
 // Health / status
 app.get("/health", async (_req, res) => {
@@ -102,7 +120,8 @@ app.get("/health", async (_req, res) => {
 // Home page
 app.get("/", async (_req, res) => {
   const { rows } = await pool.query(
-    "SELECT id, url, clicks, created_at FROM links ORDER BY created_at DESC LIMIT 20"
+    "SELECT id, url, clicks, created_at FROM links ORDER BY created_at DESC LIMIT $1",
+    [MAX_LINKS_PER_PAGE]
   );
 
   const pgOk = await pool.query("SELECT 1").then(() => true).catch(() => false);
@@ -143,7 +162,7 @@ app.post("/shorten", async (req, res) => {
   const url = req.body.url?.trim();
   if (!url) return res.status(400).send("url required");
 
-  const id = nanoid(8);
+  const id = nanoid(SHORT_ID_LENGTH);
   await pool.query("INSERT INTO links (id, url) VALUES ($1, $2)", [id, url]);
 
   const host = req.get("host");
@@ -162,26 +181,27 @@ app.post("/shorten", async (req, res) => {
   res.send(page(result + form));
 });
 
-// Create short link (API)
-app.post("/api/links", async (req, res) => {
-  const { url } = req.body;
-  if (!url) return res.status(400).json({ error: "url required" });
+// JSON API (gated by ENABLE_API env var)
+if (ENABLE_API) {
+  app.post("/api/links", async (req, res) => {
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: "url required" });
 
-  const id = nanoid(8);
-  const { rows } = await pool.query(
-    "INSERT INTO links (id, url) VALUES ($1, $2) RETURNING *",
-    [id, url]
-  );
-  res.status(201).json(rows[0]);
-});
+    const id = nanoid(SHORT_ID_LENGTH);
+    const { rows } = await pool.query(
+      "INSERT INTO links (id, url) VALUES ($1, $2) RETURNING *",
+      [id, url]
+    );
+    res.status(201).json(rows[0]);
+  });
 
-// List links (API)
-app.get("/api/links", async (_req, res) => {
-  const { rows } = await pool.query(
-    "SELECT * FROM links ORDER BY created_at DESC LIMIT 50"
-  );
-  res.json(rows);
-});
+  app.get("/api/links", async (_req, res) => {
+    const { rows } = await pool.query(
+      "SELECT * FROM links ORDER BY created_at DESC LIMIT 50"
+    );
+    res.json(rows);
+  });
+}
 
 // Redirect
 app.get("/:id", async (req, res) => {
