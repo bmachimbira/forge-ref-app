@@ -2,6 +2,9 @@ import express from "express";
 import pg from "pg";
 import Redis from "ioredis";
 import { nanoid } from "nanoid";
+import { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import multer from "multer";
 
 const app = express();
 app.use(express.json());
@@ -21,6 +24,21 @@ console.log("config:", { APP_NAME, SHORT_ID_LENGTH, CACHE_TTL, MAX_LINKS_PER_PAG
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const redis = new Redis(process.env.REDIS_URL);
+
+const s3 = process.env.S3_ENDPOINT
+  ? new S3Client({
+      endpoint: process.env.S3_ENDPOINT,
+      region: "us-east-1",
+      credentials: {
+        accessKeyId: process.env.S3_ACCESS_KEY,
+        secretAccessKey: process.env.S3_SECRET_KEY,
+      },
+      forcePathStyle: true,
+    })
+  : null;
+
+const S3_BUCKET = process.env.S3_BUCKET;
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 // --- DB bootstrap ---
 
@@ -85,6 +103,12 @@ function page(body) {
 <body>
   <h1>${APP_NAME}</h1>
   <p class="sub">URL Shortener — Forge Reference App</p>
+  <nav style="display:flex;gap:1rem;margin-bottom:1.5rem;font-size:.9rem">
+    <a href="/" style="color:#818cf8">Links</a>
+    <a href="/files" style="color:#818cf8">Files</a>
+    <a href="/health" style="color:#818cf8">Health</a>
+    <a href="/debug/env" style="color:#818cf8">Env</a>
+  </nav>
   ${body}
 </body>
 </html>`;
@@ -96,7 +120,7 @@ function page(body) {
 app.get("/debug/env", (_req, res) => {
   const safeKeys = ["APP_NAME", "SHORT_ID_LENGTH", "CACHE_TTL_SECONDS", "MAX_LINKS_PER_PAGE", "ENABLE_API"];
   const present = Object.keys(process.env)
-    .filter((k) => ["DATABASE_URL", "REDIS_URL", "S3_ENDPOINT", "S3_ACCESS_KEY", "S3_BUCKET", "PORT"].includes(k))
+    .filter((k) => ["DATABASE_URL", "REDIS_URL", "S3_ENDPOINT", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "PORT"].includes(k))
     .map((k) => ({ key: k, value: "(set)" }));
   const custom = safeKeys.map((k) => ({ key: k, value: process.env[k] || "(not set)" }));
   res.json({ injected: present, custom });
@@ -104,7 +128,7 @@ app.get("/debug/env", (_req, res) => {
 
 // Health / status
 app.get("/health", async (_req, res) => {
-  const checks = { postgres: false, redis: false };
+  const checks = { postgres: false, redis: false, s3: false };
   try {
     await pool.query("SELECT 1");
     checks.postgres = true;
@@ -113,6 +137,14 @@ app.get("/health", async (_req, res) => {
     await redis.ping();
     checks.redis = true;
   } catch {}
+  if (s3) {
+    try {
+      await s3.send(new ListObjectsV2Command({ Bucket: S3_BUCKET, MaxKeys: 1 }));
+      checks.s3 = true;
+    } catch {}
+  } else {
+    checks.s3 = "not configured";
+  }
   const ok = checks.postgres && checks.redis;
   res.status(ok ? 200 : 503).json({ status: ok ? "healthy" : "degraded", checks });
 });
@@ -126,11 +158,15 @@ app.get("/", async (_req, res) => {
 
   const pgOk = await pool.query("SELECT 1").then(() => true).catch(() => false);
   const redisOk = await redis.ping().then(() => true).catch(() => false);
+  const s3Ok = s3
+    ? await s3.send(new ListObjectsV2Command({ Bucket: S3_BUCKET, MaxKeys: 1 })).then(() => true).catch(() => false)
+    : null;
 
   const statusBar = `
     <div class="status-bar">
       <span><span class="health ${pgOk ? "up" : "down"}"></span>Postgres</span>
       <span><span class="health ${redisOk ? "up" : "down"}"></span>Redis</span>
+      ${s3 ? `<span><span class="health ${s3Ok ? "up" : "down"}"></span>S3</span>` : ""}
     </div>`;
 
   const form = `<form method="POST" action="/shorten">
@@ -202,6 +238,81 @@ if (ENABLE_API) {
     res.json(rows);
   });
 }
+
+// --- S3 / MinIO file routes ---
+
+// Upload form page
+app.get("/files", async (_req, res) => {
+  if (!s3) return res.status(501).send(page(`<p>S3 not configured. Link a MinIO project in Forge.</p>`));
+
+  let files = [];
+  try {
+    const { Contents = [] } = await s3.send(new ListObjectsV2Command({ Bucket: S3_BUCKET }));
+    files = Contents;
+  } catch {}
+
+  const uploadForm = `
+    <form method="POST" action="/files" enctype="multipart/form-data" style="display:flex;gap:.5rem;max-width:600px;width:100%;margin-bottom:2rem;align-items:center">
+      <input type="file" name="file" required style="flex:1;color:#94a3b8">
+      <button type="submit">Upload</button>
+    </form>`;
+
+  const fileRows = files
+    .map(
+      (f) =>
+        `<tr>
+          <td><a href="/files/${encodeURIComponent(f.Key)}">${f.Key}</a></td>
+          <td class="clicks">${(f.Size / 1024).toFixed(1)} KB</td>
+          <td style="color:#64748b">${new Date(f.LastModified).toLocaleDateString()}</td>
+        </tr>`
+    )
+    .join("");
+
+  const table =
+    files.length > 0
+      ? `<table><thead><tr><th>File</th><th style="text-align:right">Size</th><th>Date</th></tr></thead><tbody>${fileRows}</tbody></table>`
+      : `<p style="color:#64748b">No files uploaded yet.</p>`;
+
+  res.send(page(`<h2 style="margin-bottom:1rem;font-size:1.2rem">Files (S3/MinIO)</h2>` + uploadForm + table));
+});
+
+// Upload file
+app.post("/files", upload.single("file"), async (req, res) => {
+  if (!s3) return res.status(501).json({ error: "S3 not configured" });
+  if (!req.file) return res.status(400).send("no file");
+
+  const key = `${Date.now()}-${req.file.originalname}`;
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: key,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype,
+    })
+  );
+
+  res.redirect("/files");
+});
+
+// Download / presigned URL
+app.get("/files/:key", async (req, res) => {
+  if (!s3) return res.status(501).json({ error: "S3 not configured" });
+
+  const url = await getSignedUrl(
+    s3,
+    new GetObjectCommand({ Bucket: S3_BUCKET, Key: req.params.key }),
+    { expiresIn: 3600 }
+  );
+  res.redirect(url);
+});
+
+// Delete file (API)
+app.delete("/api/files/:key", async (req, res) => {
+  if (!s3) return res.status(501).json({ error: "S3 not configured" });
+
+  await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: req.params.key }));
+  res.json({ deleted: req.params.key });
+});
 
 // Redirect
 app.get("/:id", async (req, res) => {
