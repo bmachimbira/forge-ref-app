@@ -1,0 +1,16 @@
+{
+  "name": "forge-ref-app",
+  "version": "1.0.0",
+  "description": "URL shortener reference app for PG Forge PaaS",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "pg": "^8.13.0",
+    "ioredis": "^5.4.0",
+    "nanoid": "^5.1.0"
+  }
+}
